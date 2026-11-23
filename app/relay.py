@@ -5,6 +5,13 @@ to the classroom multicast group on each classroom port that is currently
 subscribed to the datagram's *source IP*.  The subscription table is an
 immutable object, swapped atomically, so the data plane never blocks on the
 control plane.
+
+A second UDP socket (``fec_port`` on the same up-link group) receives
+RFC 5109 repair packets; media keeps arriving on the up-link port.  Received
+media is forwarded immediately and also kept in the repair window, so an
+already-forwarded packet still helps reconstruct a lost group member.  A
+reconstructed packet is forwarded by the classroom table in effect at the
+moment it is emitted.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from ipaddress import IPv4Address
 from typing import Any
 
 from .config import Settings
+from .fec import FecRepairer, parse_media_packet
 from .table import SubscriptionTable
 
 log = logging.getLogger(__name__)
@@ -90,6 +98,17 @@ class _UplinkProtocol(asyncio.DatagramProtocol):
         log.warning("up-link socket error: %s", exc)
 
 
+class _FecProtocol(asyncio.DatagramProtocol):
+    def __init__(self, engine: "RelayEngine") -> None:
+        self._engine = engine
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        self._engine._handle_fec_datagram(data, addr[0])
+
+    def error_received(self, exc: Exception) -> None:  # pragma: no cover
+        log.warning("fec socket error: %s", exc)
+
+
 class EchoGuard:
     """Detects our own re-emitted datagrams coming back on the up-link socket.
 
@@ -148,6 +167,12 @@ class RelayEngine:
         self._allowed_sources = frozenset(settings.allowed_sources)
         self._recv_transport: asyncio.DatagramTransport | None = None
         self._send_transport: asyncio.DatagramTransport | None = None
+        self._fec_transport: asyncio.DatagramTransport | None = None
+        self._repairer: FecRepairer | None = None
+        if settings.fec_port:
+            self._repairer = FecRepairer(
+                self._emit_recovered, window=settings.fec_window
+            )
         self._started = False
         self._uplink_iface_ip: str | None = None
         self._egress_iface_ip: str | None = None
@@ -184,6 +209,8 @@ class RelayEngine:
         self._stats = RelayStats()
         self._per_source.clear()
         self._per_port.clear()
+        if self._repairer is not None:
+            self._repairer.reset_stats()
 
     def stats_view(self) -> dict[str, Any]:
         view = self._stats.as_view()
@@ -191,12 +218,25 @@ class RelayEngine:
         view["per_classroom_port"] = {
             key: value for key, value in sorted(self._per_port.items())
         }
+        if self._repairer is not None:
+            view["fec"] = {
+                "enabled": True,
+                "port": self._settings.fec_port,
+                **self._repairer.stats(),
+            }
+        else:
+            view["fec"] = {"enabled": False}
         return view
 
     async def start(self) -> None:
         if self._started:
             return
         settings = self._settings
+        if self._repairer is not None and settings.fec_port == settings.uplink_port:
+            raise ValueError(
+                "fec_port must differ from uplink_port: repair packets and "
+                "media must arrive on separate UDP ports"
+            )
         loop = asyncio.get_running_loop()
 
         self._uplink_iface_ip = resolve_interface_ip(settings.uplink_interface)
@@ -240,6 +280,22 @@ class RelayEngine:
         )
         send_sock.setblocking(False)
 
+        fec_sock: socket.socket | None = None
+        if self._repairer is not None:
+            fec_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            fec_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                fec_sock.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_RCVBUF, settings.recv_buffer
+                )
+            except OSError:  # pragma: no cover - kernel may cap it
+                pass
+            fec_sock.bind((settings.listen_address, settings.fec_port))
+            fec_sock.setsockopt(
+                socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership
+            )
+            fec_sock.setblocking(False)
+
         try:
             self._recv_transport, _ = await loop.create_datagram_endpoint(
                 lambda: _UplinkProtocol(self), sock=recv_sock
@@ -247,9 +303,15 @@ class RelayEngine:
             self._send_transport, _ = await loop.create_datagram_endpoint(
                 asyncio.DatagramProtocol, sock=send_sock
             )
+            if fec_sock is not None:
+                self._fec_transport, _ = await loop.create_datagram_endpoint(
+                    lambda: _FecProtocol(self), sock=fec_sock
+                )
         except BaseException:
             recv_sock.close()
             send_sock.close()
+            if fec_sock is not None:
+                fec_sock.close()
             raise
 
         self._started = True
@@ -262,6 +324,13 @@ class RelayEngine:
             settings.classroom_port_min,
             settings.classroom_port_max,
         )
+        if self._repairer is not None:
+            log.info(
+                "fec repair enabled: repair packets on %s:%s, window %.3fs",
+                settings.uplink_group,
+                settings.fec_port,
+                settings.fec_window,
+            )
 
     async def stop(self) -> None:
         if self._recv_transport is not None:
@@ -270,9 +339,21 @@ class RelayEngine:
         if self._send_transport is not None:
             self._send_transport.close()
             self._send_transport = None
+        if self._fec_transport is not None:
+            self._fec_transport.close()
+            self._fec_transport = None
+        if self._repairer is not None:
+            self._repairer.close()
         self._started = False
 
     # -------------------------------------------------------------- dataplane
+    @staticmethod
+    def _now() -> float:
+        try:
+            return asyncio.get_running_loop().time()
+        except RuntimeError:  # pragma: no cover - sync unit tests
+            return time.monotonic()
+
     def _handle_datagram(self, data: bytes, source: str) -> None:
         stats = self._stats
         stats.packets_in += 1
@@ -286,10 +367,18 @@ class RelayEngine:
             stats.source_not_allowed += 1
             return
 
+        repairer = self._repairer
+        pkt = parse_media_packet(data) if repairer is not None else None
+        if pkt is not None and repairer.is_duplicate(source, pkt):
+            # Already delivered once (original or reconstructed copy).
+            return
+
         table = self._table
         ports = table.ports_for(source)
         if not ports:
             stats.no_subscribers += 1
+            if pkt is not None:
+                repairer.record_media(source, pkt, data, emitted=False)
             return
         transport = self._send_transport
         if transport is None:  # pragma: no cover - only before start
@@ -298,15 +387,52 @@ class RelayEngine:
         guard = self._loop_guard
         now = 0.0
         if guard is not None:
-            try:
-                now = asyncio.get_running_loop().time()
-            except RuntimeError:  # pragma: no cover - sync unit tests
-                now = time.monotonic()
+            now = self._now()
             if guard.is_echo(data, now):
                 stats.relay_echo_ignored += 1
                 return
 
+        forwarded = self._emit_to_ports(data, ports)
+        stats.packets_forwarded += 1
+        stats.copies_forwarded += forwarded
+        if guard is not None and forwarded:
+            guard.mark(data, now)
+        if pkt is not None:
+            # Already forwarded; it still takes part in repairing its group.
+            repairer.record_media(source, pkt, data, emitted=True)
+
+    def _handle_fec_datagram(self, data: bytes, source: str) -> None:
+        if self._allowed_sources and source not in self._allowed_sources:
+            self._stats.source_not_allowed += 1
+            return
+        if self._repairer is not None:
+            self._repairer.record_fec(data, source)
+
+    def _emit_recovered(self, data: bytes, source: str) -> None:
+        """Forward a reconstructed media packet.
+
+        The classroom table is read here, at emission time, so a recovered
+        packet follows the subscriptions in effect when it is sent.
+        """
+
+        stats = self._stats
+        ports = self._table.ports_for(source)
+        if not ports:
+            stats.no_subscribers += 1
+            return
+        forwarded = self._emit_to_ports(data, ports)
+        stats.packets_forwarded += 1
+        stats.copies_forwarded += forwarded
+        guard = self._loop_guard
+        if guard is not None and forwarded:
+            guard.mark(data, self._now())
+
+    def _emit_to_ports(self, data: bytes, ports: tuple[int, ...]) -> int:
+        transport = self._send_transport
+        if transport is None:  # pragma: no cover - only before start
+            return 0
         settings = self._settings
+        stats = self._stats
         forwarded = 0
         for port in ports:
             try:
@@ -318,7 +444,4 @@ class RelayEngine:
                 stats.send_errors += 1
                 self.last_error = f"send to {settings.multicast_group}:{port} failed: {exc}"
                 log.warning(self.last_error)
-        stats.packets_forwarded += 1
-        stats.copies_forwarded += forwarded
-        if guard is not None and forwarded:
-            guard.mark(data, now)
+        return forwarded

@@ -1,7 +1,7 @@
 """Local up-link simulator.
 
-Sends the same multicast group from several different source IPs (loopback
-aliases by default) and exposes a filter API with injectable faults:
+Sends RTP media to the same multicast group from several different source IPs
+(loopback aliases by default) and exposes a filter API with injectable faults:
 
 * ``refuse_changes`` – reject the next N filter changes with HTTP 409 without
   applying anything.
@@ -9,6 +9,13 @@ aliases by default) and exposes a filter API with injectable faults:
   connection before the acknowledgment is delivered.  The applied filter is
   still visible via ``GET /sim/filter``, so a correct relay can judge by the
   actual state instead of the missing receipt.
+* ``drop_media`` – drop the next 1-2 media packets inside one protection
+  group (aligned to the group boundary), simulating up-link RTP loss.
+
+Media packets carry a fixed 12-byte RTP header (per-source sequence numbers
+and SSRC).  After every group of four media packets, one RFC 5109 repair
+packet (single level, short mask) is sent to the same group on the FEC port.
+The wire format helpers are shared with the relay in ``app.fec``.
 """
 
 from __future__ import annotations
@@ -21,11 +28,19 @@ import socket
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from ipaddress import IPv4Address
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+
+from app.fec import (
+    GROUP_SIZE,
+    MEDIA_PAYLOAD_TYPE,
+    build_fec_packet,
+    build_rtp_header,
+)
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +93,19 @@ class EmitterConfig:
     interface: str = "127.0.0.1"
     sources: tuple[str, ...] = ("127.0.0.11", "127.0.0.12", "127.0.0.13")
     interval: float = 0.2
+    fec_port: int = 5006
+
+
+@dataclass
+class RtpSourceState:
+    """Per-source RTP emitter state (sequence space is per SSRC)."""
+
+    ssrc: int
+    seq: int = 0
+    fec_seq: int = 0
+    group: list[bytes] = field(default_factory=list)
+    drop_pending: int = 0
+    drops_running: int = 0
 
 
 class FilterRequest(BaseModel):
@@ -110,6 +138,19 @@ class FaultsRequest(BaseModel):
         default=None,
         description="仅当请求的精确放行源集合与这里一致时才丢回执",
     )
+    drop_media: int = Field(
+        default=0,
+        ge=0,
+        le=2,
+        description=(
+            "让指定源在一组（4 个连续序号）内少发 1 或 2 个媒体包；"
+            "丢包从下一个组边界开始"
+        ),
+    )
+    drop_media_sources: list[str] | None = Field(
+        default=None,
+        description="drop_media 只作用于这些源 IP；缺省为全部源",
+    )
     reset: bool = False
 
 
@@ -129,7 +170,10 @@ class SimulatorState:
         self.lock = asyncio.Lock()
         self.sent: dict[str, int] = {}
         self.blocked: dict[str, int] = {}
+        self.dropped: dict[str, int] = {}
+        self.fec_sent: dict[str, int] = {}
         self.last_sent: dict[str, dict[str, Any]] = {}
+        self.last_dropped: dict[str, dict[str, Any]] = {}
         self.started_at = time.time()
         self.emitter_task: asyncio.Task | None = None
         self.config = EmitterConfig(
@@ -144,8 +188,17 @@ class SimulatorState:
                 if item.strip()
             ),
             interval=_env_float("SIM_INTERVAL", EmitterConfig.interval),
+            fec_port=int(_env("SIM_FEC_PORT", str(EmitterConfig.fec_port))),
         )
         self._sockets: dict[str, socket.socket] = {}
+        self._rtp: dict[str, RtpSourceState] = {}
+
+    def rtp_state(self, source: str) -> RtpSourceState:
+        state = self._rtp.get(source)
+        if state is None:
+            state = RtpSourceState(ssrc=int(IPv4Address(source)))
+            self._rtp[source] = state
+        return state
 
     def open_sockets(self) -> None:
         for source in self.config.sources:
@@ -168,42 +221,92 @@ class SimulatorState:
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         self.open_sockets()
-        sequence = 0
         try:
             while True:
-                sequence += 1
                 now_ms = int(time.time() * 1000)
                 for source in self.config.sources:
                     allowed = self.filter.allows(source)
                     if not allowed:
                         self.blocked[source] = self.blocked.get(source, 0) + 1
                         continue
+                    rtp = self.rtp_state(source)
+                    seq = rtp.seq
+                    timestamp = (rtp.ssrc + seq * 3000) & 0xFFFFFFFF
                     payload = json.dumps(
                         {
                             "src": source,
-                            "seq": sequence,
+                            "seq": seq,
                             "sent_at_ms": now_ms,
                             "sim_source": "uplink",
                         },
                         separators=(",", ":"),
                     ).encode()
+                    datagram = build_rtp_header(
+                        seq=seq,
+                        timestamp=timestamp,
+                        ssrc=rtp.ssrc,
+                        payload_type=MEDIA_PAYLOAD_TYPE,
+                    ) + payload
+                    rtp.group.append(datagram)
+                    rtp.seq = (seq + 1) & 0xFFFF
                     sock = self._sockets[source]
-                    try:
-                        await loop.run_in_executor(
-                            None,
-                            sock.sendto,
-                            payload,
-                            (self.config.group, self.config.port),
+
+                    # Injected loss: start dropping at a group boundary so
+                    # the 1-2 missing packets fall inside one group.
+                    if rtp.drop_pending and seq % GROUP_SIZE == 0:
+                        rtp.drops_running = rtp.drop_pending
+                        rtp.drop_pending = 0
+                    if rtp.drops_running:
+                        rtp.drops_running -= 1
+                        self.dropped[source] = self.dropped.get(source, 0) + 1
+                        self.last_dropped[source] = {
+                            "seq": seq,
+                            "at_ms": now_ms,
+                        }
+                    else:
+                        try:
+                            await loop.run_in_executor(
+                                None,
+                                sock.sendto,
+                                datagram,
+                                (self.config.group, self.config.port),
+                            )
+                        except OSError as exc:  # pragma: no cover
+                            log.warning("emit from %s failed: %s", source, exc)
+                        else:
+                            self.sent[source] = self.sent.get(source, 0) + 1
+                            self.last_sent[source] = {
+                                "seq": seq,
+                                "at_ms": now_ms,
+                                "bytes": len(datagram),
+                            }
+
+                    if len(rtp.group) == GROUP_SIZE:
+                        # The repair packet protects the original four media
+                        # packets, including any that were dropped on the way.
+                        fec = build_fec_packet(
+                            rtp.group,
+                            fec_seq=rtp.fec_seq,
+                            ssrc=rtp.ssrc,
+                            timestamp=timestamp,
                         )
-                    except OSError as exc:  # pragma: no cover
-                        log.warning("emit from %s failed: %s", source, exc)
-                        continue
-                    self.sent[source] = self.sent.get(source, 0) + 1
-                    self.last_sent[source] = {
-                        "seq": sequence,
-                        "at_ms": now_ms,
-                        "bytes": len(payload),
-                    }
+                        rtp.group = []
+                        rtp.fec_seq = (rtp.fec_seq + 1) & 0xFFFF
+                        try:
+                            await loop.run_in_executor(
+                                None,
+                                sock.sendto,
+                                fec,
+                                (self.config.group, self.config.fec_port),
+                            )
+                        except OSError as exc:  # pragma: no cover
+                            log.warning(
+                                "fec emit from %s failed: %s", source, exc
+                            )
+                        else:
+                            self.fec_sent[source] = (
+                                self.fec_sent.get(source, 0) + 1
+                            )
                 await asyncio.sleep(self.config.interval)
         finally:
             self.close_sockets()
@@ -273,6 +376,7 @@ async def healthz() -> dict[str, Any]:
         and not state.emitter_task.done(),
         "group": state.config.group,
         "port": state.config.port,
+        "fec_port": state.config.fec_port,
         "sources": list(state.config.sources),
         "interval": state.config.interval,
     }
@@ -290,6 +394,11 @@ async def get_faults() -> dict[str, Any]:
         "drop_receipts": state.faults.drop_receipts,
         "refuse_only_sources": state.faults.refuse_only_sources,
         "drop_only_sources": state.faults.drop_only_sources,
+        "drop_media_pending": {
+            source: rtp.drop_pending + rtp.drops_running
+            for source, rtp in state._rtp.items()
+            if rtp.drop_pending or rtp.drops_running
+        },
     }
 
 
@@ -298,17 +407,29 @@ async def set_faults(payload: FaultsRequest) -> dict[str, Any]:
     async with state.lock:
         if payload.reset:
             state.faults = FaultState()
+            for rtp in state._rtp.values():
+                rtp.drop_pending = 0
+                rtp.drops_running = 0
         if payload.refuse_changes:
             state.faults.refuse_changes = payload.refuse_changes
             state.faults.refuse_only_sources = payload.refuse_only_sources
         if payload.drop_receipts:
             state.faults.drop_receipts = payload.drop_receipts
             state.faults.drop_only_sources = payload.drop_only_sources
+        if payload.drop_media:
+            targets = payload.drop_media_sources or list(state.config.sources)
+            for source in targets:
+                state.rtp_state(source).drop_pending += payload.drop_media
         return {
             "refuse_changes": state.faults.refuse_changes,
             "drop_receipts": state.faults.drop_receipts,
             "refuse_only_sources": state.faults.refuse_only_sources,
             "drop_only_sources": state.faults.drop_only_sources,
+            "drop_media_pending": {
+                source: rtp.drop_pending + rtp.drops_running
+                for source, rtp in state._rtp.items()
+                if rtp.drop_pending or rtp.drops_running
+            },
         }
 
 
@@ -369,10 +490,14 @@ async def get_stats() -> dict[str, Any]:
         },
         "sent": dict(state.sent),
         "blocked": dict(state.blocked),
+        "dropped": dict(state.dropped),
+        "fec_sent": dict(state.fec_sent),
         "last_sent": dict(state.last_sent),
+        "last_dropped": dict(state.last_dropped),
         "config": {
             "group": state.config.group,
             "port": state.config.port,
+            "fec_port": state.config.fec_port,
             "interface": state.config.interface,
             "sources": list(state.config.sources),
             "interval": state.config.interval,

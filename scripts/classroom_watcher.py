@@ -2,7 +2,8 @@
 
 Joins the classroom group on the given ports and prints a rolling summary of
 which source each classroom port is receiving, so the switch can be observed
-without extra tooling.
+without extra tooling.  Media arrives as RTP datagrams with a fixed 12-byte
+header; the JSON payload starts right after it.
 """
 
 from __future__ import annotations
@@ -19,6 +20,14 @@ from collections import defaultdict
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name)
     return default if value is None or value == "" else value
+
+
+def _media_payload(data: bytes) -> bytes:
+    """Strip the fixed 12-byte RTP header when present."""
+
+    if len(data) >= 12 and data[0] == 0x80:
+        return data[12:]
+    return data
 
 
 def main() -> int:
@@ -68,7 +77,7 @@ def main() -> int:
                 got_any = True
                 source = addr[0]
                 try:
-                    payload = json.loads(data)
+                    payload = json.loads(_media_payload(data))
                     source = payload.get("src", source)
                     seq = payload.get("seq")
                 except ValueError:

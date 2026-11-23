@@ -71,6 +71,12 @@ class Settings:
     uplink_required: bool = False
     # Initial (old) subscription table, "port=source;port=source".
     initial_table: str = ""
+    # UDP port receiving RFC 5109 repair (FEC) packets on the up-link group;
+    # media keeps arriving on ``uplink_port``.  0 disables loss repair.
+    fec_port: int = 5006
+    # Repair window per protection group (four aligned sequence numbers),
+    # in seconds, counted from the first media or repair packet of the group.
+    fec_window: float = 0.1
     # Receive buffer for the up-link socket.
     recv_buffer: int = 4 * 1024 * 1024
     # Number of events kept in the in-memory audit trail.
@@ -109,6 +115,8 @@ def load_settings() -> Settings:
             "RELAY_UPLINK_REQUIRED", Settings.uplink_required
         ),
         initial_table=_env("RELAY_INITIAL_TABLE", Settings.initial_table),
+        fec_port=_env_int("RELAY_FEC_PORT", Settings.fec_port),
+        fec_window=_env_float("RELAY_FEC_WINDOW", Settings.fec_window),
         recv_buffer=_env_int("RELAY_RECV_BUFFER", Settings.recv_buffer),
         event_log_size=_env_int("RELAY_EVENT_LOG_SIZE", Settings.event_log_size),
     )

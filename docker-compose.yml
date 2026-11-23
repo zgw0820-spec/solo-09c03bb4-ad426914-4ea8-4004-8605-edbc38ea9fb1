@@ -26,9 +26,11 @@ services:
     environment:
       SIM_GROUP: "239.255.42.10"
       SIM_PORT: "5004"
+      SIM_FEC_PORT: "5006"
       SIM_INTERFACE: "127.0.0.1"
       SIM_SOURCES: "127.0.0.11,127.0.0.12,127.0.0.13"
-      SIM_INTERVAL: "0.2"
+      # 20ms 间隔：一组 4 包约在 60-80ms 内到齐，落在 100ms 修复窗口里
+      SIM_INTERVAL: "0.02"
       SIM_INITIAL_MODE: "allow"
       SIM_INITIAL_SOURCES: "127.0.0.11"
     healthcheck:
@@ -61,6 +63,8 @@ services:
       RELAY_MULTICAST_INTERFACE: "127.0.0.1"
       RELAY_CLASSROOM_PORT_MIN: "16000"
       RELAY_CLASSROOM_PORT_MAX: "16999"
+      RELAY_FEC_PORT: "5006"
+      RELAY_FEC_WINDOW: "0.1"
       RELAY_UPLINK_URL: "http://127.0.0.1:9100"
       RELAY_UPLINK_REQUIRED: "true"
       RELAY_INITIAL_TABLE: "16001=127.0.0.11;16002=127.0.0.11;16003=127.0.0.11"

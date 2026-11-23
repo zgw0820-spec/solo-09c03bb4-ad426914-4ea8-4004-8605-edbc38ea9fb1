@@ -63,6 +63,19 @@ class FaultRequest(BaseModel):
         default=None,
         description="仅当请求的精确放行源集合与这里一致时才丢回执",
     )
+    drop_media: int = Field(
+        default=0,
+        ge=0,
+        le=2,
+        description=(
+            "让模拟器在一组（4 个连续序号）内少发 1 或 2 个媒体包，"
+            "用于演示 RFC 5109 丢包修复"
+        ),
+    )
+    drop_media_sources: list[str] | None = Field(
+        default=None,
+        description="drop_media 只作用于这些源 IP；缺省为全部源",
+    )
     reset: bool = Field(
         default=False, description="先清零所有故障计数和累计统计"
     )
@@ -340,7 +353,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post(
         "/demo/uplink/faults",
-        summary="演示：注入拒绝改表 / 改成后丢回执故障",
+        summary="演示：注入拒绝改表 / 丢回执 / 组内丢包故障",
         tags=["demo"],
     )
     async def demo_set_faults(payload: FaultRequest) -> Any:

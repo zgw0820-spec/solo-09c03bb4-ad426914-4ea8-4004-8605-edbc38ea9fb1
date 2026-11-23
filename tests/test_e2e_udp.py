@@ -58,6 +58,14 @@ class ClassroomReceiver:
     _thread: threading.Thread | None = None
     _stop: threading.Event = field(default_factory=threading.Event)
 
+    @staticmethod
+    def _media_payload(data: bytes) -> bytes:
+        """Strip the fixed 12-byte RTP header when present."""
+
+        if len(data) >= 12 and data[0] == 0x80:
+            return data[12:]
+        return data
+
     def start(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -80,7 +88,7 @@ class ClassroomReceiver:
                 except OSError:
                     break
                 try:
-                    payload = json.loads(data)
+                    payload = json.loads(self._media_payload(data))
                 except ValueError:
                     payload = {"raw": data.decode(errors="replace")}
                 self.packets.append((time.monotonic(), payload))
